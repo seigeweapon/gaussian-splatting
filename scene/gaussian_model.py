@@ -13,13 +13,39 @@ import torch
 import numpy as np
 from utils.general_utils import inverse_sigmoid, get_expon_lr_func, build_rotation
 from torch import nn
+import torch.distributed as dist
 import os
 from utils.system_utils import mkdir_p
+import utils.general_utils as utils
 from plyfile import PlyData, PlyElement
 from utils.sh_utils import RGB2SH
 from simple_knn._C import distCUDA2
 from utils.graphics_utils import BasicPointCloud
 from utils.general_utils import strip_symmetric, build_scaling_rotation
+
+def all_gather_array(array, ws):
+    local_size = array.shape[0]
+    all_sizes = [torch.tensor(0, dtype=torch.int64, device=array.device) for _ in range(ws)]
+    dist.all_gather(all_sizes, torch.tensor(local_size, dtype=torch.int64, device=array.device))
+    max_size = max([s.item() for s in all_sizes])
+
+    size_diff = max_size - local_size
+    if size_diff:
+        padding_shape = list(array.shape)
+        padding_shape[0] = size_diff
+        padded = torch.cat((array, torch.zeros(torch.Size(padding_shape), device=array.device, dtype=array.dtype)), dim=0)
+    else:
+        padded = array
+
+    all_arrays_padded = [torch.zeros_like(padded) for _ in range(ws)]
+    dist.all_gather(all_arrays_padded, padded)
+
+    all_arrays = []
+    for a, size in zip(all_arrays_padded, all_sizes):
+        all_arrays.append(a[:size])
+
+    return torch.cat(all_arrays, dim=0)
+
 
 class GaussianModel:
 
@@ -364,11 +390,31 @@ class GaussianModel:
         new_rotation = self._rotation[selected_pts_mask].repeat(N,1)
         new_features_dc = self._features_dc[selected_pts_mask].repeat(N,1,1)
         new_features_rest = self._features_rest[selected_pts_mask].repeat(N,1,1)
-        new_opacity = self._opacity[selected_pts_mask].repeat(N,1)
+        new_opacities = self._opacity[selected_pts_mask].repeat(N,1)
 
-        self.densification_postfix(new_xyz, new_features_dc, new_features_rest, new_opacity, new_scaling, new_rotation)
+        # all-gather new points
+        if utils.WORLD_SIZE > 1:
+            dist.barrier(group=utils.DEFAULT_GROUP)
 
-        prune_filter = torch.cat((selected_pts_mask, torch.zeros(N * selected_pts_mask.sum(), device="cuda", dtype=bool)))
+            all_new_xyz = all_gather_array(new_xyz.contiguous(), utils.WORLD_SIZE)
+            all_new_features_dc = all_gather_array(new_features_dc.contiguous(), utils.WORLD_SIZE)
+            all_new_features_rest = all_gather_array(new_features_rest.contiguous(), utils.WORLD_SIZE)
+            all_new_scaling = all_gather_array(new_scaling.contiguous(), utils.WORLD_SIZE)
+            all_new_rotation = all_gather_array(new_rotation.contiguous(), utils.WORLD_SIZE)
+            all_new_opacities = all_gather_array(new_opacities.contiguous(), utils.WORLD_SIZE)
+            
+            print(f"densify_and_split RANK{utils.GLOBAL_RANK} points grow from {self._xyz.shape[0]} to {self._xyz.shape[0] + all_new_xyz.shape[0]} (delta={all_new_xyz.shape[0]}), new points of this rank: {new_xyz.shape[0]}")
+            self.densification_postfix(all_new_xyz, all_new_features_dc, all_new_features_rest, all_new_opacities, all_new_scaling, all_new_rotation)
+            prune_filter = torch.cat((selected_pts_mask, torch.zeros(all_new_xyz.shape[0], device="cuda", dtype=bool)))
+            print(f"RANK{utils.GLOBAL_RANK} points to prune: {prune_filter.sum().item()}")
+        else:
+            self.densification_postfix(new_xyz, new_features_dc, new_features_rest, new_opacities, new_scaling, new_rotation)
+            prune_filter = torch.cat((selected_pts_mask, torch.zeros(N * selected_pts_mask.sum(), device="cuda", dtype=bool)))
+
+        if utils.WORLD_SIZE > 1:
+            dist.barrier(group=utils.DEFAULT_GROUP)
+            dist.all_reduce(prune_filter, op=dist.ReduceOp.SUM)
+            print(f"RANK{utils.GLOBAL_RANK} all_points to prune: {prune_filter.sum().item()}")
         self.prune_points(prune_filter)
 
     def densify_and_clone(self, grads, grad_threshold, scene_extent):
@@ -383,8 +429,22 @@ class GaussianModel:
         new_opacities = self._opacity[selected_pts_mask]
         new_scaling = self._scaling[selected_pts_mask]
         new_rotation = self._rotation[selected_pts_mask]
+        
+        # all-gather new points
+        if utils.WORLD_SIZE > 1:
+            dist.barrier(group=utils.DEFAULT_GROUP)
 
-        self.densification_postfix(new_xyz, new_features_dc, new_features_rest, new_opacities, new_scaling, new_rotation)
+            all_new_xyz = all_gather_array(new_xyz.contiguous(), utils.WORLD_SIZE)
+            all_new_features_dc = all_gather_array(new_features_dc.contiguous(), utils.WORLD_SIZE)
+            all_new_features_rest = all_gather_array(new_features_rest.contiguous(), utils.WORLD_SIZE)
+            all_new_scaling = all_gather_array(new_scaling.contiguous(), utils.WORLD_SIZE)
+            all_new_rotation = all_gather_array(new_rotation.contiguous(), utils.WORLD_SIZE)
+            all_new_opacities = all_gather_array(new_opacities.contiguous(), utils.WORLD_SIZE)
+
+            print(f"densify_and_clone RANK{utils.GLOBAL_RANK} points grow from {self._xyz.shape[0]} to {self._xyz.shape[0] + all_new_xyz.shape[0]} (delta={all_new_xyz.shape[0]}), new points of this rank: {new_xyz.shape[0]}")
+            self.densification_postfix(all_new_xyz, all_new_features_dc, all_new_features_rest, all_new_opacities, all_new_scaling, all_new_rotation)
+        else:
+            self.densification_postfix(new_xyz, new_features_dc, new_features_rest, new_opacities, new_scaling, new_rotation)
 
     def densify_and_prune(self, max_grad, min_opacity, extent, max_screen_size):
         grads = self.xyz_gradient_accum / self.denom
@@ -398,6 +458,9 @@ class GaussianModel:
             big_points_vs = self.max_radii2D > max_screen_size
             big_points_ws = self.get_scaling.max(dim=1).values > 0.1 * extent
             prune_mask = torch.logical_or(torch.logical_or(prune_mask, big_points_vs), big_points_ws)
+        if utils.WORLD_SIZE > 1:
+            dist.barrier(group=utils.DEFAULT_GROUP)
+            dist.all_reduce(prune_mask, op=dist.ReduceOp.SUM)
         self.prune_points(prune_mask)
 
         torch.cuda.empty_cache()

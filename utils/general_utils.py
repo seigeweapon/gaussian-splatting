@@ -14,6 +14,14 @@ import sys
 from datetime import datetime
 import numpy as np
 import random
+import os
+import torch.distributed as dist
+
+GLOBAL_RANK = None  # rank in all nodes
+LOCAL_RANK = 0  # local rank in the node
+WORLD_SIZE = 1
+DEFAULT_GROUP = None
+IN_NODE_GROUP = None
 
 def inverse_sigmoid(x):
     return torch.log(x/(1-x))
@@ -127,7 +135,67 @@ def safe_state(silent):
 
     sys.stdout = F(silent)
 
-    random.seed(0)
-    np.random.seed(0)
-    torch.manual_seed(0)
-    torch.cuda.set_device(torch.device("cuda:0"))
+    global LOCAL_RANK
+    random.seed(LOCAL_RANK)
+    np.random.seed(LOCAL_RANK)
+    torch.manual_seed(LOCAL_RANK)
+    torch.cuda.set_device(torch.device("cuda", LOCAL_RANK))
+
+
+def one_node_device_count():
+    global WORLD_SIZE
+    return min(torch.cuda.device_count(), WORLD_SIZE)
+
+
+class SingleGPUGroup:
+    def __init__(self):
+        pass
+
+    def rank(self):
+        return 0
+
+    def size(self):
+        return 1
+
+
+def init_distributed(args):
+    global GLOBAL_RANK, LOCAL_RANK, WORLD_SIZE, DEFAULT_GROUP, IN_NODE_GROUP
+    GLOBAL_RANK = int(os.environ.get("RANK", 0))
+    LOCAL_RANK = int(os.environ.get("LOCAL_RANK", 0))
+    WORLD_SIZE = int(os.environ.get("WORLD_SIZE", 1))
+    if WORLD_SIZE > 1:
+        dist.init_process_group(
+            "nccl", rank=GLOBAL_RANK, world_size=WORLD_SIZE
+        )
+        assert torch.cuda.is_available(), "Distributed mode requires CUDA"
+        assert (
+            dist.is_initialized()
+        ), "Distributed mode requires init_distributed() to be called first"
+
+        DEFAULT_GROUP = dist.group.WORLD
+
+        num_gpu_per_node = one_node_device_count()
+        n_of_nodes = WORLD_SIZE // num_gpu_per_node
+        all_in_node_group = []
+        for rank in range(n_of_nodes):
+            in_node_group_ranks = list(
+                range(rank * num_gpu_per_node, (rank + 1) * num_gpu_per_node)
+            )
+            all_in_node_group.append(dist.new_group(in_node_group_ranks))
+        node_rank = GLOBAL_RANK // num_gpu_per_node
+        IN_NODE_GROUP = all_in_node_group[node_rank]
+        print(
+            "Initializing -> "
+            + " world_size: "
+            + str(WORLD_SIZE)
+            + " rank: "
+            + str(DEFAULT_GROUP.rank())
+            + "     in_node_size: "
+            + str(IN_NODE_GROUP.size())
+            + " in_node_rank: "
+            + str(IN_NODE_GROUP.rank())
+        )
+
+    else:
+        DEFAULT_GROUP = SingleGPUGroup()
+        IN_NODE_GROUP = SingleGPUGroup()

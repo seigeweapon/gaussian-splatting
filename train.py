@@ -16,7 +16,9 @@ from utils.loss_utils import l1_loss, ssim
 from gaussian_renderer import render, network_gui
 import sys
 from scene import Scene, GaussianModel
-from utils.general_utils import safe_state
+from utils.general_utils import safe_state, init_distributed
+import utils.general_utils as utils
+import torch.distributed as dist
 import uuid
 from tqdm import tqdm
 from utils.image_utils import psnr
@@ -95,19 +97,23 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         iter_end.record()
 
         with torch.no_grad():
-            # Progress bar
-            ema_loss_for_log = 0.4 * loss.item() + 0.6 * ema_loss_for_log
-            if iteration % 10 == 0:
-                progress_bar.set_postfix({"Loss": f"{ema_loss_for_log:.{7}f}"})
-                progress_bar.update(10)
-            if iteration == opt.iterations:
-                progress_bar.close()
+            # if utils.WORLD_SIZE > 1:
+            #     dist.barrier(group=utils.DEFAULT_GROUP)
 
-            # Log and save
-            training_report(tb_writer, iteration, Ll1, loss, l1_loss, iter_start.elapsed_time(iter_end), testing_iterations, scene, render, (pipe, background))
-            if (iteration in saving_iterations):
-                print("\n[ITER {}] Saving Gaussians".format(iteration))
-                scene.save(iteration)
+            if utils.GLOBAL_RANK == 0:
+                # Progress bar
+                ema_loss_for_log = 0.4 * loss.item() + 0.6 * ema_loss_for_log
+                if iteration % 10 == 0:
+                    progress_bar.set_postfix({"Loss": f"{ema_loss_for_log:.{7}f}"})
+                    progress_bar.update(10)
+                if iteration == opt.iterations:
+                    progress_bar.close()
+
+                # Log and save
+                training_report(tb_writer, iteration, Ll1, loss, l1_loss, iter_start.elapsed_time(iter_end), testing_iterations, scene, render, (pipe, background))
+                if (iteration in saving_iterations):
+                    print("\n[ITER {}] Saving Gaussians".format(iteration))
+                    scene.save(iteration)
 
             # Densification
             if iteration < opt.densify_until_iter:
@@ -118,9 +124,28 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 if iteration > opt.densify_from_iter and iteration % opt.densification_interval == 0:
                     size_threshold = 20 if iteration > opt.opacity_reset_interval else None
                     gaussians.densify_and_prune(opt.densify_grad_threshold, 0.005, scene.cameras_extent, size_threshold)
+                    # Todo: all-gather delta points
                 
                 if iteration % opt.opacity_reset_interval == 0 or (dataset.white_background and iteration == opt.densify_from_iter):
                     gaussians.reset_opacity()
+
+            # all-reduce gradients
+            if utils.WORLD_SIZE > 1:
+                gaussians._xyz.grad = gaussians._xyz.grad.contiguous()
+                gaussians._features_dc.grad = gaussians._features_dc.grad.contiguous()
+                gaussians._features_rest.grad = gaussians._features_rest.grad.contiguous()
+                gaussians._scaling.grad = gaussians._scaling.grad.contiguous()
+                gaussians._rotation.grad = gaussians._rotation.grad.contiguous()
+                gaussians._opacity.grad = gaussians._opacity.grad.contiguous()
+                dist.all_reduce(gaussians._xyz.grad, op=dist.ReduceOp.SUM, group=utils.DEFAULT_GROUP)
+                dist.all_reduce(gaussians._features_dc.grad, op=dist.ReduceOp.SUM, group=utils.DEFAULT_GROUP)
+                dist.all_reduce(gaussians._features_rest.grad, op=dist.ReduceOp.SUM, group=utils.DEFAULT_GROUP)
+                dist.all_reduce(gaussians._scaling.grad, op=dist.ReduceOp.SUM, group=utils.DEFAULT_GROUP)
+                dist.all_reduce(gaussians._rotation.grad, op=dist.ReduceOp.SUM, group=utils.DEFAULT_GROUP)
+                dist.all_reduce(gaussians._opacity.grad, op=dist.ReduceOp.SUM, group=utils.DEFAULT_GROUP)
+
+                print("Iter" + str(iteration) + " RANK " + str(utils.GLOBAL_RANK) 
+                    + ": nPoints:" + str(gaussians._xyz.shape[0]) + " points[10000]:" + str(gaussians._xyz[10000]))
 
             # Optimizer step
             if iteration < opt.iterations:
@@ -131,19 +156,28 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 print("\n[ITER {}] Saving Checkpoint".format(iteration))
                 torch.save((gaussians.capture(), iteration), scene.model_path + "/chkpnt" + str(iteration) + ".pth")
 
-def prepare_output_and_logger(args):    
-    if not args.model_path:
-        if os.getenv('OAR_JOB_ID'):
-            unique_str=os.getenv('OAR_JOB_ID')
-        else:
-            unique_str = str(uuid.uuid4())
-        args.model_path = os.path.join("./output/", unique_str[0:10])
+
+def prepare_output_and_logger(args):
+    if utils.GLOBAL_RANK == 0:
+        if not args.model_path:
+            if os.getenv('OAR_JOB_ID'):
+                unique_str=os.getenv('OAR_JOB_ID')
+            else:
+                unique_str = str(uuid.uuid4())
+            args.model_path = os.path.join("./output/", unique_str[0:10])
+            
+        # Set up output folder
+        print("Output folder: {}".format(args.model_path))
+        os.makedirs(args.model_path, exist_ok = True)
         
-    # Set up output folder
-    print("Output folder: {}".format(args.model_path))
-    os.makedirs(args.model_path, exist_ok = True)
-    with open(os.path.join(args.model_path, "cfg_args"), 'w') as cfg_log_f:
-        cfg_log_f.write(str(Namespace(**vars(args))))
+    if utils.WORLD_SIZE > 1:
+        dist.barrier(
+            group=utils.DEFAULT_GROUP
+        )  # log_folder is created before other ranks start writing log.
+
+    if utils.GLOBAL_RANK == 0:
+        with open(os.path.join(args.model_path, "cfg_args"), 'w') as cfg_log_f:
+            cfg_log_f.write(str(Namespace(**vars(args))))
 
     # Create Tensorboard writer
     tb_writer = None
@@ -210,13 +244,17 @@ if __name__ == "__main__":
     
     print("Optimizing " + args.model_path)
 
+    init_distributed(args)
+
     # Initialize system state (RNG)
     safe_state(args.quiet)
 
     # Start GUI server, configure and run training
-    network_gui.init(args.ip, args.port)
+    # network_gui.init(args.ip, args.port)
     torch.autograd.set_detect_anomaly(args.detect_anomaly)
     training(lp.extract(args), op.extract(args), pp.extract(args), args.test_iterations, args.save_iterations, args.checkpoint_iterations, args.start_checkpoint, args.debug_from)
 
     # All done
+    if utils.WORLD_SIZE > 1:
+        dist.barrier(group=utils.DEFAULT_GROUP)
     print("\nTraining complete.")
