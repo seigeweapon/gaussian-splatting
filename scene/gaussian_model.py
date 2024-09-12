@@ -403,10 +403,10 @@ class GaussianModel:
             all_new_rotation = all_gather_array(new_rotation.contiguous(), utils.WORLD_SIZE)
             all_new_opacities = all_gather_array(new_opacities.contiguous(), utils.WORLD_SIZE)
             
-            print(f"densify_and_split RANK{utils.GLOBAL_RANK} points grow from {self._xyz.shape[0]} to {self._xyz.shape[0] + all_new_xyz.shape[0]} (delta={all_new_xyz.shape[0]}), new points of this rank: {new_xyz.shape[0]}")
+            # print(f"densify_and_split RANK{utils.GLOBAL_RANK} points grow from {self._xyz.shape[0]} to {self._xyz.shape[0] + all_new_xyz.shape[0]} (delta={all_new_xyz.shape[0]}), new points of this rank: {new_xyz.shape[0]}")
             self.densification_postfix(all_new_xyz, all_new_features_dc, all_new_features_rest, all_new_opacities, all_new_scaling, all_new_rotation)
             prune_filter = torch.cat((selected_pts_mask, torch.zeros(all_new_xyz.shape[0], device="cuda", dtype=bool)))
-            print(f"RANK{utils.GLOBAL_RANK} points to prune: {prune_filter.sum().item()}")
+            # print(f"RANK{utils.GLOBAL_RANK} points to prune: {prune_filter.sum().item()}")
         else:
             self.densification_postfix(new_xyz, new_features_dc, new_features_rest, new_opacities, new_scaling, new_rotation)
             prune_filter = torch.cat((selected_pts_mask, torch.zeros(N * selected_pts_mask.sum(), device="cuda", dtype=bool)))
@@ -414,7 +414,7 @@ class GaussianModel:
         if utils.WORLD_SIZE > 1:
             dist.barrier(group=utils.DEFAULT_GROUP)
             dist.all_reduce(prune_filter, op=dist.ReduceOp.SUM)
-            print(f"RANK{utils.GLOBAL_RANK} all_points to prune: {prune_filter.sum().item()}")
+            # print(f"RANK{utils.GLOBAL_RANK} all_points to prune: {prune_filter.sum().item()}")
         self.prune_points(prune_filter)
 
     def densify_and_clone(self, grads, grad_threshold, scene_extent):
@@ -441,7 +441,7 @@ class GaussianModel:
             all_new_rotation = all_gather_array(new_rotation.contiguous(), utils.WORLD_SIZE)
             all_new_opacities = all_gather_array(new_opacities.contiguous(), utils.WORLD_SIZE)
 
-            print(f"densify_and_clone RANK{utils.GLOBAL_RANK} points grow from {self._xyz.shape[0]} to {self._xyz.shape[0] + all_new_xyz.shape[0]} (delta={all_new_xyz.shape[0]}), new points of this rank: {new_xyz.shape[0]}")
+            # print(f"densify_and_clone RANK{utils.GLOBAL_RANK} points grow from {self._xyz.shape[0]} to {self._xyz.shape[0] + all_new_xyz.shape[0]} (delta={all_new_xyz.shape[0]}), new points of this rank: {new_xyz.shape[0]}")
             self.densification_postfix(all_new_xyz, all_new_features_dc, all_new_features_rest, all_new_opacities, all_new_scaling, all_new_rotation)
         else:
             self.densification_postfix(new_xyz, new_features_dc, new_features_rest, new_opacities, new_scaling, new_rotation)

@@ -130,7 +130,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                     gaussians.reset_opacity()
 
             # all-reduce gradients
-            if utils.WORLD_SIZE > 1:
+            if utils.WORLD_SIZE > 1 and gaussians._xyz.grad is not None:
                 gaussians._xyz.grad = gaussians._xyz.grad.contiguous()
                 gaussians._features_dc.grad = gaussians._features_dc.grad.contiguous()
                 gaussians._features_rest.grad = gaussians._features_rest.grad.contiguous()
@@ -144,8 +144,8 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 dist.all_reduce(gaussians._rotation.grad, op=dist.ReduceOp.SUM, group=utils.DEFAULT_GROUP)
                 dist.all_reduce(gaussians._opacity.grad, op=dist.ReduceOp.SUM, group=utils.DEFAULT_GROUP)
 
-                print("Iter" + str(iteration) + " RANK " + str(utils.GLOBAL_RANK) 
-                    + ": nPoints:" + str(gaussians._xyz.shape[0]) + " points[10000]:" + str(gaussians._xyz[10000]))
+                # print("Iter" + str(iteration) + " RANK " + str(utils.GLOBAL_RANK) 
+                #     + ": nPoints:" + str(gaussians._xyz.shape[0]) + " points[10000]:" + str(gaussians._xyz[10000]))
 
             # Optimizer step
             if iteration < opt.iterations:
